@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+.Python
+build/
+venv/
+.vscode/
+.env
+
+# Data files
+data/
+*.parquet
+*.json
+*.csv
+
+# Logs
+*.log
+logs/
+
+
+# Chrome driver
+chromedriver
+chromedriver.exe
+
+
+.DS_Store
