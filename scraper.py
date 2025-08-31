@@ -1,249 +1,113 @@
-"""Twitter scraper for Indian stock market tweets."""
+"""
+Twitter scraper for Indian stock market tweets using twikit.
+Integrated with existing pipeline architecture.
+"""
 
 import asyncio
-import aiohttp
 import logging
-import random
 import time
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
-from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import re
+import json
+from twikit import Client
 
 from config import *
-from utils import *
+from utils import (
+    setup_logging, extract_hashtags, extract_mentions, 
+    generate_tweet_hash, validate_tweet_data, deduplicate_tweets,
+    calculate_tweet_age_hours
+)
 
 class TwitterScraper:
-    """Twitter scraper with anti-bot detection and rate limiting."""
+    """Twitter scraper using twikit with anti-bot detection and rate limiting."""
     
     def __init__(self):
         self.logger = setup_logging(LOG_LEVEL)
+        self.client = Client(language='en-US')
         self.scraped_tweets = []
         self.session_requests = 0
         self.session_start = time.time()
+        self.authenticated = False
         
-    def setup_driver(self, headless: bool = True) -> webdriver.Chrome:
-        """Setup Chrome driver with anti-detection measures."""
-        options = Options()
-        
-        if headless:
-            options.add_argument('--headless')
-        
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option('useAutomationExtension', False)
-        options.add_argument('--disable-extensions')
-        options.add_argument('--disable-plugins')
-        options.add_argument('--disable-images')
-        options.add_argument('--disable-javascript')
-        options.add_argument(f'--user-agent={get_random_user_agent()}')
-        
-        # Random window size
-        width = random.randint(1200, 1920)
-        height = random.randint(800, 1080)
-        options.add_argument(f'--window-size={width},{height}')
-        
+    async def initialize_client(self) -> bool:
+        """Initialize and authenticate twikit client."""
         try:
-            driver = webdriver.Chrome(options=options)
-            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            return driver
-        except Exception as e:
-            self.logger.error(f"Failed to setup Chrome driver: {e}")
-            raise
+            # Try to load existing cookies
+            self.client.load_cookies("cookies.json")
+            self.logger.info("Loaded existing cookies for authentication")
+            self.authenticated = True
+            return True
+            
+        except Exception:
+            self.logger.info("No existing cookies found, attempting guest login...")
+            try:
+                await self.client.login_guest()
+                self.client.save_cookies("cookies.json")
+                self.logger.info("Guest login successful, cookies saved")
+                self.authenticated = True
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"Failed to authenticate with Twitter: {e}")
+                self.authenticated = False
+                return False
     
-    async def scrape_with_requests(self, hashtag: str, max_tweets: int = 500) -> List[Dict[str, Any]]:
-        """Scrape tweets using requests + BeautifulSoup (fallback method)."""
-        tweets = []
-        
+    def extract_tweet_data(self, tweet, hashtag_source: str) -> Optional[Dict[str, Any]]:
+        """Extract structured data from twikit Tweet object."""
         try:
-            search_url = create_search_url(hashtag)
-            
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-                headers={'User-Agent': get_random_user_agent()}
-            ) as session:
-                
-                async with session.get(search_url) as response:
-                    if response.status == 200:
-                        html = await response.text()
-                        soup = BeautifulSoup(html, 'html.parser')
-                        
-                        # Parse tweets from HTML structure
-                        tweet_elements = soup.find_all('div', {'data-testid': 'tweet'})
-                        
-                        for element in tweet_elements[:max_tweets]:
-                            tweet_data = self.extract_tweet_data_from_element(element, 'requests')
-                            if tweet_data and self.is_recent_tweet(tweet_data.get('timestamp')):
-                                tweets.append(tweet_data)
-                    
-                    await async_sleep_with_jitter(MIN_DELAY, MAX_DELAY)
-                    
-        except Exception as e:
-            self.logger.error(f"Error scraping with requests for {hashtag}: {e}")
-        
-        return tweets
-    
-    def scrape_with_selenium(self, hashtag: str, max_tweets: int = 500) -> List[Dict[str, Any]]:
-        """Scrape tweets using Selenium WebDriver."""
-        tweets = []
-        driver = None
-        
-        try:
-            driver = self.setup_driver(headless=True)
-            search_url = create_search_url(hashtag)
-            
-            self.logger.info(f"Navigating to: {search_url}")
-            driver.get(search_url)
-            
-            # Random wait to mimic human behavior
-            time.sleep(random.uniform(3, 7))
-            
-            # Scroll and collect tweets
-            last_height = driver.execute_script("return document.body.scrollHeight")
-            scroll_attempts = 0
-            max_scrolls = 10
-            
-            while len(tweets) < max_tweets and scroll_attempts < max_scrolls:
+            # Get timestamp with fallback handling
+            try:
+                tweet_time = tweet.created_at_datetime
+            except AttributeError:
                 try:
-                    # Find tweet elements
-                    tweet_elements = driver.find_elements(By.CSS_SELECTOR, '[data-testid="tweet"]')
-                    
-                    for element in tweet_elements:
-                        if len(tweets) >= max_tweets:
-                            break
-                        
-                        tweet_data = self.extract_tweet_data_from_element(element, 'selenium')
-                        if tweet_data and self.is_recent_tweet(tweet_data.get('timestamp')):
-                            tweet_hash = generate_tweet_hash(
-                                tweet_data.get('content', ''),
-                                tweet_data.get('username', ''),
-                                str(tweet_data.get('timestamp', ''))
-                            )
-                            
-                            # Check for duplicates
-                            if not any(t.get('hash') == tweet_hash for t in tweets):
-                                tweet_data['hash'] = tweet_hash
-                                tweet_data['hashtag_source'] = hashtag
-                                tweets.append(tweet_data)
-                    
-                    # Scroll down
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(random.uniform(2, 4))
-                    
-                    # Check if new content loaded
-                    new_height = driver.execute_script("return document.body.scrollHeight")
-                    if new_height == last_height:
-                        scroll_attempts += 1
-                    else:
-                        scroll_attempts = 0
-                        last_height = new_height
-                
-                except Exception as e:
-                    self.logger.warning(f"Error during scrolling: {e}")
-                    break
-            
-        except Exception as e:
-            self.logger.error(f"Error scraping with Selenium for {hashtag}: {e}")
-        
-        finally:
-            if driver:
-                driver.quit()
-        
-        return tweets
-    
-    def extract_tweet_data_from_element(self, element, method: str) -> Optional[Dict[str, Any]]:
-        """Extract tweet data from web element."""
-        try:
-            if method == 'selenium':
-                # Extract using Selenium WebDriver
-                username_elem = element.find_element(By.CSS_SELECTOR, '[data-testid="User-Name"] span')
-                username = safe_extract_text(username_elem).replace('@', '')
-                
-                content_elem = element.find_element(By.CSS_SELECTOR, '[data-testid="tweetText"]')
-                content = safe_extract_text(content_elem)
-                
-                time_elem = element.find_element(By.CSS_SELECTOR, 'time')
-                timestamp_str = time_elem.get_attribute('datetime') if time_elem else None
-                
-                # Extract engagement metrics
-                try:
-                    likes_elem = element.find_element(By.CSS_SELECTOR, '[data-testid="like"] span')
-                    likes = int(safe_extract_text(likes_elem).replace(',', '') or '0')
+                    tweet_time = datetime.fromisoformat(tweet.created_at.replace('Z', '+00:00'))
                 except:
-                    likes = 0
-                
-                try:
-                    retweets_elem = element.find_element(By.CSS_SELECTOR, '[data-testid="retweet"] span')
-                    retweets = int(safe_extract_text(retweets_elem).replace(',', '') or '0')
-                except:
-                    retweets = 0
-                
-                try:
-                    replies_elem = element.find_element(By.CSS_SELECTOR, '[data-testid="reply"] span')
-                    replies = int(safe_extract_text(replies_elem).replace(',', '') or '0')
-                except:
-                    replies = 0
-                
-            else:  # BeautifulSoup method
-                username_elem = element.find('span', {'data-testid': 'User-Name'})
-                username = safe_extract_text(username_elem).replace('@', '') if username_elem else ""
-                
-                content_elem = element.find('div', {'data-testid': 'tweetText'})
-                content = safe_extract_text(content_elem) if content_elem else ""
-                
-                time_elem = element.find('time')
-                timestamp_str = time_elem.get('datetime') if time_elem else None
-                
-                # Extract engagement metrics from BeautifulSoup
-                likes = retweets = replies = 0
-                
-                like_elem = element.find('div', {'data-testid': 'like'})
-                if like_elem:
-                    likes = int(safe_extract_text(like_elem).replace(',', '') or '0')
-                
-                retweet_elem = element.find('div', {'data-testid': 'retweet'})
-                if retweet_elem:
-                    retweets = int(safe_extract_text(retweet_elem).replace(',', '') or '0')
-                
-                reply_elem = element.find('div', {'data-testid': 'reply'})
-                if reply_elem:
-                    replies = int(safe_extract_text(reply_elem).replace(',', '') or '0')
+                    tweet_time = datetime.now(timezone.utc)
             
-            # Parse timestamp
-            timestamp = None
-            if timestamp_str:
-                try:
-                    timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                except:
-                    timestamp = parse_relative_time(timestamp_str)
+            # Extract basic tweet data
+            tweet_text = getattr(tweet, 'text', '') or getattr(tweet, 'full_text', '')
+            username = getattr(tweet.user, 'screen_name', 'unknown') if hasattr(tweet, 'user') else 'unknown'
             
-            if not all([username, content]):
-                return None
+            # Extract engagement metrics with fallbacks
+            likes = getattr(tweet, 'favorite_count', 0) or 0
+            retweets = getattr(tweet, 'retweet_count', 0) or 0
+            replies = getattr(tweet, 'reply_count', 0) or 0
             
-            return {
+            # Extract mentions and hashtags from text
+            mentions = extract_mentions(tweet_text)
+            hashtags = extract_hashtags(tweet_text)
+            
+            # Generate hash for deduplication
+            tweet_hash = generate_tweet_hash(tweet_text, username, tweet_time.isoformat())
+            
+            data = {
+                'id': str(tweet.id),
+                'hash': tweet_hash,
                 'username': username,
-                'content': content,
-                'timestamp': timestamp or datetime.now(timezone.utc),
+                'content': tweet_text,
+                'timestamp': tweet_time,
                 'likes': likes,
                 'retweets': retweets,
                 'replies': replies,
-                'hashtags': extract_hashtags(content),
-                'mentions': extract_mentions(content),
-                'scraped_at': datetime.now(timezone.utc)
+                'total_engagement': likes + retweets + replies,
+                'mentions': mentions,
+                'hashtags': hashtags,
+                'hashtag_source': hashtag_source,
+                'url': f"https://twitter.com/{username}/status/{tweet.id}",
+                'scraped_at': datetime.now(timezone.utc),
+                'content_length': len(tweet_text),
+                'hashtag_count': len(hashtags),
+                'mention_count': len(mentions)
             }
-        
+            
+            return data
+            
         except Exception as e:
             self.logger.warning(f"Error extracting tweet data: {e}")
             return None
     
-    def is_recent_tweet(self, timestamp: Optional[datetime]) -> bool:
+    def is_recent_tweet(self, timestamp: datetime) -> bool:
         """Check if tweet is within the target time window."""
         if not timestamp:
             return False
@@ -252,59 +116,211 @@ class TwitterScraper:
         return age_hours <= TIME_WINDOW_HOURS
     
     async def scrape_hashtag(self, hashtag: str, max_tweets_per_hashtag: int) -> List[Dict[str, Any]]:
-        """Scrape tweets for a specific hashtag."""
-        self.logger.info(f"Starting to scrape hashtag: {hashtag}")
+        """Scrape tweets for a specific hashtag using twikit."""
+        if not self.authenticated:
+            if not await self.initialize_client():
+                return []
         
-        # Try Selenium first, fall back to requests if needed
+        self.logger.info(f"Scraping hashtag: {hashtag} (target: {max_tweets_per_hashtag} tweets)")
+        
         tweets = []
+        seen_ids = set()
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=TIME_WINDOW_HOURS)
         
         try:
-            # Primary method: Selenium
-            tweets = self.scrape_with_selenium(hashtag, max_tweets_per_hashtag)
+            # Search for tweets
+            search_results = await self.client.search_tweet(
+                hashtag, 
+                product="Latest", 
+                count=min(max_tweets_per_hashtag, 100)  # API limit per request
+            )
             
-            if len(tweets) < max_tweets_per_hashtag // 2:
-                # Fallback method: Requests + BeautifulSoup
-                self.logger.info(f"Low tweet count for {hashtag}, trying fallback method")
-                additional_tweets = await self.scrape_with_requests(hashtag, max_tweets_per_hashtag)
-                tweets.extend(additional_tweets)
-        
+            if not search_results:
+                self.logger.warning(f"No tweets found for {hashtag}")
+                return []
+            
+            for tweet in search_results:
+                # Skip if already processed
+                if tweet.id in seen_ids:
+                    continue
+                
+                # Extract tweet data
+                tweet_data = self.extract_tweet_data(tweet, hashtag)
+                if not tweet_data:
+                    continue
+                
+                # Check if tweet is recent enough
+                if not self.is_recent_tweet(tweet_data['timestamp']):
+                    self.logger.debug(f"Tweet {tweet.id} is too old, skipping...")
+                    continue
+                
+                # Validate tweet data
+                if not validate_tweet_data(tweet_data):
+                    continue
+                
+                tweets.append(tweet_data)
+                seen_ids.add(tweet.id)
+                
+                if len(tweets) >= max_tweets_per_hashtag:
+                    break
+            
+            # Add delay to respect rate limits
+            await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+            
         except Exception as e:
             self.logger.error(f"Error scraping hashtag {hashtag}: {e}")
-        
-        # Deduplicate and validate
-        tweets = deduplicate_tweets(tweets)
-        tweets = [t for t in tweets if validate_tweet_data(t)]
         
         self.logger.info(f"Collected {len(tweets)} tweets for hashtag: {hashtag}")
         return tweets
     
+    async def scrape_hashtag_with_pagination(self, hashtag: str, max_tweets: int) -> List[Dict[str, Any]]:
+        """Scrape hashtag with pagination to get more tweets."""
+        if not self.authenticated:
+            if not await self.initialize_client():
+                return []
+        
+        tweets = []
+        seen_ids = set()
+        cursor = None
+        requests_made = 0
+        max_requests = 5  # Limit API requests to avoid rate limiting
+        
+        self.logger.info(f"Starting paginated scraping for {hashtag}")
+        
+        while len(tweets) < max_tweets and requests_made < max_requests:
+            try:
+                if cursor:
+                    # Get next page
+                    search_results = await cursor.next()
+                else:
+                    # Initial search
+                    search_results = await self.client.search_tweet(
+                        hashtag,
+                        product="Latest",
+                        count=100
+                    )
+                    cursor = search_results
+                
+                requests_made += 1
+                
+                if not search_results:
+                    break
+                
+                page_tweets = 0
+                for tweet in search_results:
+                    if tweet.id in seen_ids:
+                        continue
+                    
+                    tweet_data = self.extract_tweet_data(tweet, hashtag)
+                    if not tweet_data:
+                        continue
+                    
+                    if not self.is_recent_tweet(tweet_data['timestamp']):
+                        # If we hit old tweets, we can stop paginating
+                        self.logger.info(f"Reached old tweets for {hashtag}, stopping pagination")
+                        return tweets
+                    
+                    if validate_tweet_data(tweet_data):
+                        tweets.append(tweet_data)
+                        seen_ids.add(tweet.id)
+                        page_tweets += 1
+                    
+                    if len(tweets) >= max_tweets:
+                        break
+                
+                self.logger.info(f"Page {requests_made}: collected {page_tweets} tweets for {hashtag}")
+                
+                # Rate limiting delay
+                await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+                
+            except Exception as e:
+                self.logger.error(f"Error in pagination for {hashtag}: {e}")
+                break
+        
+        return tweets
+    
     async def scrape_all_hashtags(self) -> List[Dict[str, Any]]:
         """Scrape tweets from all configured hashtags."""
+        if not await self.initialize_client():
+            self.logger.error("Failed to initialize Twitter client")
+            return []
+        
         self.logger.info("Starting comprehensive tweet scraping")
+        self.logger.info(f"Target hashtags: {SEARCH_HASHTAGS}")
+        self.logger.info(f"Target tweets: {TARGET_TWEETS}")
+        self.logger.info(f"Time window: {TIME_WINDOW_HOURS} hours")
         
         all_tweets = []
-        tweets_per_hashtag = TARGET_TWEETS // len(SEARCH_HASHTAGS)
+        tweets_per_hashtag = max(TARGET_TWEETS // len(SEARCH_HASHTAGS), 100)
         
-        # Create semaphore for concurrent scraping
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-        
-        async def scrape_with_semaphore(hashtag):
-            async with semaphore:
-                return await self.scrape_hashtag(hashtag, tweets_per_hashtag)
-        
-        # Scrape all hashtags concurrently
-        tasks = [scrape_with_semaphore(hashtag) for hashtag in SEARCH_HASHTAGS]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Process results
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                self.logger.error(f"Failed to scrape {SEARCH_HASHTAGS[i]}: {result}")
-            else:
-                all_tweets.extend(result)
+        # Sequential scraping to avoid overwhelming the API
+        for hashtag in SEARCH_HASHTAGS:
+            try:
+                self.logger.info(f"Scraping {hashtag}...")
+                
+                # Use pagination for better coverage
+                hashtag_tweets = await self.scrape_hashtag_with_pagination(
+                    hashtag, 
+                    tweets_per_hashtag
+                )
+                
+                if hashtag_tweets:
+                    all_tweets.extend(hashtag_tweets)
+                    self.logger.info(f"Successfully scraped {len(hashtag_tweets)} tweets from {hashtag}")
+                else:
+                    self.logger.warning(f"No tweets collected for {hashtag}")
+                
+                # Longer delay between hashtags
+                await asyncio.sleep(random.uniform(3, 6))
+                
+            except Exception as e:
+                self.logger.error(f"Failed to scrape hashtag {hashtag}: {e}")
+                continue
         
         # Final deduplication across all hashtags
+        self.logger.info(f"Deduplicating {len(all_tweets)} collected tweets...")
         all_tweets = deduplicate_tweets(all_tweets)
         
-        self.logger.info(f"Total tweets collected: {len(all_tweets)}")
-        return all_tweets
+        # Additional validation
+        valid_tweets = [tweet for tweet in all_tweets if validate_tweet_data(tweet)]
+        
+        self.logger.info(f"Final collection: {len(valid_tweets)} valid tweets from {len(all_tweets)} total")
+        
+        # Save raw collected data for debugging
+        if valid_tweets:
+            with open("data/raw_tweets_debug.json", "w", encoding="utf-8") as f:
+                json.dump(valid_tweets, f, ensure_ascii=False, indent=2, default=str)
+        
+        return valid_tweets
+    
+    async def test_connection(self) -> bool:
+        """Test if the scraper can connect and fetch sample data."""
+        if not await self.initialize_client():
+            return False
+        
+        try:
+            # Try to search for a simple query
+            test_results = await self.client.search_tweet("#nifty50", product="Latest", count=5)
+            
+            if test_results:
+                self.logger.info("Connection test successful - able to fetch tweets")
+                return True
+            else:
+                self.logger.warning("Connection test failed - no results returned")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Connection test failed: {e}")
+            return False
+    
+    def get_scraping_stats(self) -> Dict[str, Any]:
+        """Get statistics about the current scraping session."""
+        session_duration = time.time() - self.session_start
+        
+        return {
+            'session_duration_minutes': round(session_duration / 60, 2),
+            'total_requests': self.session_requests,
+            'requests_per_minute': round(self.session_requests / (session_duration / 60), 2) if session_duration > 0 else 0,
+            'authenticated': self.authenticated,
+            'tweets_collected': len(self.scraped_tweets)
+        }

@@ -5,6 +5,7 @@ build/
 venv/
 .vscode/
 .env
+cookies.json
 
 # Data files
 data/
